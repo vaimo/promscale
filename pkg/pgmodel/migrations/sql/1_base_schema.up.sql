@@ -139,6 +139,7 @@ CREATE TABLE SCHEMA_CATALOG.metric (
     id SERIAL PRIMARY KEY,
     metric_name text NOT NULL,
     table_name name NOT NULL,
+    creation_completed BOOLEAN NOT NULL DEFAULT false,
     default_chunk_interval BOOLEAN NOT NULL DEFAULT true,
     retention_period INTERVAL DEFAULT NULL, --NULL to use the default retention_period
     UNIQUE (metric_name) INCLUDE (table_name),
@@ -171,6 +172,45 @@ $func$
 LANGUAGE SQL STABLE PARALLEL SAFE;
 GRANT EXECUTE ON FUNCTION SCHEMA_CATALOG.get_default_retention_period() TO prom_reader;
 
+CREATE PROCEDURE SCHEMA_CATALOG.finalize_metric_creation()
+AS $proc$
+DECLARE
+    r RECORD;
+    created boolean;
+BEGIN
+    FOR r IN
+        SELECT *
+        FROM SCHEMA_CATALOG.metric
+        WHERE NOT creation_completed
+    LOOP
+        -- stupidly create table ... partition of X first takes an access share lock
+        -- and then an access exclusive lock. Such an upgrade can, and does, cause
+        -- deadlocks. Taking the stronger lock beforehand prevents such deadlocks.
+        -- We only need the lock on the parent.
+        LOCK TABLE ONLY SCHEMA_CATALOG.series in ACCESS EXCLUSIVE mode;
+        --make sure still not created after lock
+        SELECT creation_completed INTO created
+        FROM SCHEMA_CATALOG.metric m
+        WHERE m.id = r.id;
+
+        IF created THEN
+            --don't commit or release lock
+            CONTINUE;
+        END IF;
+
+        EXECUTE format($$
+           ALTER TABLE SCHEMA_CATALOG.series ATTACH PARTITION SCHEMA_DATA_SERIES.%1$I FOR VALUES IN (%2$L)
+        $$, r.table_name, r.id);
+
+        UPDATE SCHEMA_CATALOG.metric SET creation_completed = TRUE WHERE id = r.id;
+        COMMIT;
+    END LOOP;
+END;
+$proc$ LANGUAGE PLPGSQL;
+COMMENT ON PROCEDURE SCHEMA_CATALOG.finalize_metric_creation()
+IS 'Finalizes metric creation. This procedure should be run by the connector automatically';
+GRANT EXECUTE ON PROCEDURE SCHEMA_CATALOG.finalize_metric_creation() TO prom_writer;
+
 CREATE OR REPLACE FUNCTION SCHEMA_CATALOG.make_metric_table()
     RETURNS trigger
     AS $func$
@@ -193,21 +233,17 @@ BEGIN
     SELECT SCHEMA_CATALOG.get_or_create_label_id('__name__', NEW.metric_name)
     INTO STRICT label_id;
 
-
-    -- stupidly create table ... partition of X first takes an access share lock
-    -- and then an access exclusive lock. Such an upgrade can, and does, cause
-    -- deadlocks. Taking the stronger lock beforehand prevents such deadlocks.
-    -- We only need the lock on the parent.
-    LOCK TABLE ONLY SCHEMA_CATALOG.series in ACCESS EXCLUSIVE mode;
-
     --note that because labels[1] is unique across partitions and UNIQUE(labels) inside partition, labels are guaranteed globally unique
     EXECUTE format($$
-        CREATE TABLE SCHEMA_DATA_SERIES.%1$I PARTITION OF SCHEMA_CATALOG.series (
+        CREATE TABLE SCHEMA_DATA_SERIES.%1$I (
+            id bigserial,
+            metric_id int,
+            labels SCHEMA_PROM.label_array
             CHECK(labels[1] = %2$L AND labels[1] IS NOT NULL),
             CHECK(metric_id = %3$L),
             UNIQUE(labels) INCLUDE (id),
             PRIMARY KEY(id)
-        ) FOR VALUES IN (%3$L)
+        )
     $$, NEW.table_name, label_id, NEW.id);
 
    --chunks where the end time is before now()-10 minutes will be compressed
@@ -502,13 +538,13 @@ GRANT EXECUTE ON FUNCTION SCHEMA_CATALOG.get_metric_table_name_if_exists(text) t
 -- Public function to get the name of the table for a given metric
 -- This will create the metric table if it does not yet exist.
 CREATE OR REPLACE FUNCTION SCHEMA_CATALOG.get_or_create_metric_table_name(
-        metric_name text, OUT id int, OUT table_name name)
+        metric_name text, OUT id int, OUT table_name name, OUT possibly_new BOOLEAN)
 AS $func$
-   SELECT id, table_name::name
+   SELECT id, table_name::name, false
    FROM SCHEMA_CATALOG.metric m
    WHERE m.metric_name = get_or_create_metric_table_name.metric_name
    UNION ALL
-   SELECT *
+   SELECT *, true
    FROM SCHEMA_CATALOG.create_metric_table(get_or_create_metric_table_name.metric_name)
    LIMIT 1
 $func$
