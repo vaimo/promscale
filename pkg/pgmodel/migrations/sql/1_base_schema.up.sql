@@ -155,6 +155,15 @@ INSERT INTO SCHEMA_CATALOG.default(key,value) VALUES
 ('chunk_interval', (INTERVAL '8 hours')::text),
 ('retention_period', (90 * INTERVAL '1 day')::text);
 
+--Canonical lock ordering:
+--metrics
+--data table
+--labels
+--series parent
+--series partition
+
+--constraints:
+--- The prom_metric view takes locks in the order: data table, series partition.
 
 CREATE OR REPLACE FUNCTION SCHEMA_CATALOG.get_default_chunk_interval()
     RETURNS INTERVAL
@@ -172,6 +181,7 @@ $func$
 LANGUAGE SQL STABLE PARALLEL SAFE;
 GRANT EXECUTE ON FUNCTION SCHEMA_CATALOG.get_default_retention_period() TO prom_reader;
 
+--lock-order: metric table, data_table, series parent, series partition
 CREATE PROCEDURE SCHEMA_CATALOG.finalize_metric_creation()
 AS $proc$
 DECLARE
@@ -183,26 +193,39 @@ BEGIN
         FROM SCHEMA_CATALOG.metric
         WHERE NOT creation_completed
     LOOP
-        -- stupidly create table ... partition of X first takes an access share lock
-        -- and then an access exclusive lock. Such an upgrade can, and does, cause
-        -- deadlocks. Taking the stronger lock beforehand prevents such deadlocks.
-        -- We only need the lock on the parent.
-        LOCK TABLE ONLY SCHEMA_CATALOG.series in ACCESS EXCLUSIVE mode;
-        --make sure still not created after lock
-        SELECT creation_completed INTO created
+        SELECT creation_completed
+        INTO created
         FROM SCHEMA_CATALOG.metric m
-        WHERE m.id = r.id;
+        WHERE m.id = r.id
+        FOR UPDATE;
 
         IF created THEN
-            --don't commit or release lock
+            --release row lock
+            COMMIT;
             CONTINUE;
         END IF;
 
         EXECUTE format($$
+            ALTER TABLE SCHEMA_DATA.%I SET (
+                timescaledb.compress,
+                timescaledb.compress_segmentby = 'series_id',
+                timescaledb.compress_orderby = 'time'
+            ); $$, r.table_name);
+
+        --chunks where the end time is before now()-1 hour will be compressed
+        PERFORM add_compress_chunks_policy(format('SCHEMA_DATA.%I', r.table_name), INTERVAL '1 hour');
+
+        --do this before taking exclusive lock to minimize work after taking lock
+        UPDATE SCHEMA_CATALOG.metric SET creation_completed = TRUE WHERE id = r.id;
+
+        --we will need this lock for attaching the partition so take it now
+        --to avoid lock upgrade. Its critical to minimize work done while this
+        --lock is taken.
+        LOCK TABLE ONLY SCHEMA_CATALOG.series IN ACCESS EXCLUSIVE mode;
+
+        EXECUTE format($$
            ALTER TABLE SCHEMA_CATALOG.series ATTACH PARTITION SCHEMA_DATA_SERIES.%1$I FOR VALUES IN (%2$L)
         $$, r.table_name, r.id);
-
-        UPDATE SCHEMA_CATALOG.metric SET creation_completed = TRUE WHERE id = r.id;
         COMMIT;
     END LOOP;
 END;
@@ -211,28 +234,25 @@ COMMENT ON PROCEDURE SCHEMA_CATALOG.finalize_metric_creation()
 IS 'Finalizes metric creation. This procedure should be run by the connector automatically';
 GRANT EXECUTE ON PROCEDURE SCHEMA_CATALOG.finalize_metric_creation() TO prom_writer;
 
+--lock-order: data table, labels, series partition.
 CREATE OR REPLACE FUNCTION SCHEMA_CATALOG.make_metric_table()
     RETURNS trigger
     AS $func$
 DECLARE
   label_id INT;
 BEGIN
-   EXECUTE format('CREATE TABLE SCHEMA_DATA.%I(time TIMESTAMPTZ, value DOUBLE PRECISION, series_id INT)',
+   EXECUTE format('CREATE TABLE SCHEMA_DATA.%I(time TIMESTAMPTZ NOT NULL, value DOUBLE PRECISION, series_id INT NOT NULL)',
                     NEW.table_name);
-   EXECUTE format('CREATE INDEX ON SCHEMA_DATA.%I (series_id, time) INCLUDE (value)',
-                    NEW.table_name);
+   EXECUTE format('CREATE INDEX data_series_id_time_%s ON SCHEMA_DATA.%I (series_id, time) INCLUDE (value)',
+                    NEW.id, NEW.table_name);
+   EXECUTE format('CREATE INDEX data_time_%s ON SCHEMA_DATA.%I (time desc) INCLUDE (series_id, value)',
+                    NEW.id, NEW.table_name);
    PERFORM create_hypertable(format('SCHEMA_DATA.%I', NEW.table_name), 'time',
-                             chunk_time_interval=>SCHEMA_CATALOG.get_default_chunk_interval());
-   EXECUTE format($$
-     ALTER TABLE SCHEMA_DATA.%I SET (
-        timescaledb.compress,
-        timescaledb.compress_segmentby = 'series_id',
-        timescaledb.compress_orderby = 'time'
-    ); $$, NEW.table_name);
+                             chunk_time_interval=>SCHEMA_CATALOG.get_default_chunk_interval(),
+                             create_default_indexes=>false);
 
     SELECT SCHEMA_CATALOG.get_or_create_label_id('__name__', NEW.metric_name)
     INTO STRICT label_id;
-
     --note that because labels[1] is unique across partitions and UNIQUE(labels) inside partition, labels are guaranteed globally unique
     EXECUTE format($$
         CREATE TABLE SCHEMA_DATA_SERIES.%1$I (
@@ -246,8 +266,6 @@ BEGIN
         )
     $$, NEW.table_name, label_id, NEW.id);
 
-   --chunks where the end time is before now()-10 minutes will be compressed
-   PERFORM add_compress_chunks_policy(format('SCHEMA_DATA.%I', NEW.table_name), INTERVAL '10 minutes');
    RETURN NEW;
 END
 $func$
@@ -307,6 +325,7 @@ GRANT EXECUTE ON FUNCTION SCHEMA_CATALOG.pg_name_unique(text, text) TO prom_read
 --The function inserts into the metric catalog table,
 --  which causes the make_metric_table trigger to fire,
 --  which actually creates the table
+-- locks: metric, make_metric_table[data table, labels, series partition]
 CREATE OR REPLACE FUNCTION SCHEMA_CATALOG.create_metric_table(
         metric_name_arg text, OUT id int, OUT table_name name)
 AS $func$
@@ -392,6 +411,7 @@ GRANT EXECUTE ON FUNCTION SCHEMA_CATALOG.get_or_create_label_key(TEXT) to prom_w
 -- Get a new label array position for a label key. For any metric,
 -- we want the positions to be as compact as possible.
 -- This uses some pretty heavy locks so use sparingly.
+-- locks: label_key_position, data table, series partition (in view creation),
 CREATE OR REPLACE FUNCTION SCHEMA_CATALOG.get_new_pos_for_key(
         metric_name text, key_name text)
     RETURNS int
@@ -778,21 +798,12 @@ BEGIN
    SELECT mtn.id, mtn.table_name FROM SCHEMA_CATALOG.get_or_create_metric_table_name(metric_name) mtn
    INTO metric_id, table_name;
 
-   --lock the series table parent first in access share mode so that
-   --its locked before any labels etc are created. Establishes a lock
-   --order of series table then labels table.  This prevents
-   --deadlocks between calls that create metrics and concurrent calls
-   --that don't create metric but do create labels. Where the label-creating
-   --workers is trying to create a series and the metric-creator is waiting
-   --for a label-creation to complete making it's series. This guarantess that
-   -- any metric-creator finshes before other processes create series or labels.
-   LOCK TABLE ONLY SCHEMA_CATALOG.series in ACCESS SHARE mode;
+   --the data table could be locked during label key creation
+   --and must be locked before the series parent according to lock ordering
+   EXECUTE format($query$
+        LOCK TABLE ONLY SCHEMA_DATA.%1$I IN ACCESS SHARE MODE
+    $query$, table_name);
 
-   --This query MUST take all of its locks after the create metric table above
-   --since this requires a lower level lock on the series table than the potential
-   --exclusive lock on series when adding the series partition. This is why this
-   --is a PLPGSQL function and not a SQL Function (a SQL function parses/plans all
-   --statement during startup, which would take a lock on the series table)
    EXECUTE format($query$
     WITH CTE AS (
         SELECT SCHEMA_PROM.label_array($1, $2, $3)
