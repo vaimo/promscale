@@ -1384,7 +1384,11 @@ func (m *TimeSeries) Unmarshal(dAtA []byte) error {
 			if postIndex > l {
 				return io.ErrUnexpectedEOF
 			}
-			m.Labels = append(m.Labels, Label{})
+			if len(m.Labels) < cap(m.Labels) {
+				m.Labels = m.Labels[:len(m.Labels)+1]
+			} else {
+				m.Labels = append(m.Labels, Label{})
+			}
 			if err := m.Labels[len(m.Labels)-1].Unmarshal(dAtA[iNdEx:postIndex]); err != nil {
 				return err
 			}
@@ -1418,7 +1422,11 @@ func (m *TimeSeries) Unmarshal(dAtA []byte) error {
 			if postIndex > l {
 				return io.ErrUnexpectedEOF
 			}
-			m.Samples = append(m.Samples, Sample{})
+			if len(m.Samples) < cap(m.Samples) {
+				m.Samples = m.Samples[:len(m.Samples)+1]
+			} else {
+				m.Samples = append(m.Samples, Sample{})
+			}
 			if err := m.Samples[len(m.Samples)-1].Unmarshal(dAtA[iNdEx:postIndex]); err != nil {
 				return err
 			}
@@ -1624,7 +1632,11 @@ func (m *Labels) Unmarshal(dAtA []byte) error {
 			if postIndex > l {
 				return io.ErrUnexpectedEOF
 			}
-			m.Labels = append(m.Labels, Label{})
+			if len(m.Labels) < cap(m.Labels) {
+				m.Labels = m.Labels[:len(m.Labels)+1]
+			} else {
+				m.Labels = append(m.Labels, Label{})
+			}
 			if err := m.Labels[len(m.Labels)-1].Unmarshal(dAtA[iNdEx:postIndex]); err != nil {
 				return err
 			}

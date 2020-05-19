@@ -937,7 +937,11 @@ func (m *WriteRequest) Unmarshal(dAtA []byte) error {
 			if postIndex > l {
 				return io.ErrUnexpectedEOF
 			}
-			m.Timeseries = append(m.Timeseries, TimeSeries{})
+			if len(m.Timeseries) < cap(m.Timeseries) {
+				m.Timeseries = m.Timeseries[:len(m.Timeseries)+1]
+			} else {
+				m.Timeseries = append(m.Timeseries, TimeSeries{})
+			}
 			if err := m.Timeseries[len(m.Timeseries)-1].Unmarshal(dAtA[iNdEx:postIndex]); err != nil {
 				return err
 			}
