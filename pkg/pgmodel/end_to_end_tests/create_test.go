@@ -134,7 +134,7 @@ func TestSQLChunkInterval(t *testing.T) {
 		}
 		ingestor := NewPgxIngestor(db)
 		defer ingestor.Close()
-		_, err := ingestor.Ingest(ts)
+		_, err := ingestor.Ingest(ts, NewInsertCtx())
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -371,7 +371,7 @@ func TestSQLIngest(t *testing.T) {
 			withDB(t, databaseName, func(db *pgxpool.Pool, t testing.TB) {
 				ingestor := NewPgxIngestor(db)
 				defer ingestor.Close()
-				cnt, err := ingestor.Ingest(tcase.metrics)
+				cnt, err := ingestor.Ingest(tcase.metrics, NewInsertCtx())
 				if err != nil && err != tcase.expectErr {
 					t.Fatalf("got an unexpected error %v", err)
 				}

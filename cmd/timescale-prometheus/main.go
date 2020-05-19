@@ -315,14 +315,14 @@ func write(writer pgmodel.DBInserter) http.Handler {
 			return
 		}
 
-		var req prompb.WriteRequest
-		if err := proto.Unmarshal(reqBuf, &req); err != nil {
+		ctx := pgmodel.NewInsertCtx()
+		if err := proto.Unmarshal(reqBuf, &ctx.WriteRequest); err != nil {
 			log.Error("msg", "Unmarshal error", "err", err.Error())
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
 
-		ts := req.GetTimeseries()
+		ts := ctx.WriteRequest.GetTimeseries()
 		receivedBatchCount := 0
 
 		for _, t := range ts {
@@ -332,7 +332,7 @@ func write(writer pgmodel.DBInserter) http.Handler {
 		receivedSamples.Add(float64(receivedBatchCount))
 		begin := time.Now()
 
-		numSamples, err := writer.Ingest(req.GetTimeseries())
+		numSamples, err := writer.Ingest(ctx.WriteRequest.GetTimeseries(), ctx)
 		if err != nil {
 			log.Warn("msg", "Error sending samples to remote storage", "err", err, "num_samples", numSamples)
 			http.Error(w, err.Error(), http.StatusInternalServerError)
