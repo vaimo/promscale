@@ -12,7 +12,8 @@ DATA = $(EXT_SQL_FILE)
 MODULE_big = $(EXTENSION)
 
 SRCS = \
-	src/support.c
+	src/support.c \
+	src/funcs.c
 
 OBJS = $(SRCS:.c=.o)
 DEPS = $(SRCS:.c=.d)

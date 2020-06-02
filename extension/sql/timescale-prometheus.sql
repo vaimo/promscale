@@ -150,3 +150,10 @@ CREATE OPERATOR @extschema@.!=~ (
     RIGHTARG = pattern,
     FUNCTION = @extschema@.label_find_key_not_regex
 );
+
+
+CREATE OR REPLACE FUNCTION gapfill_array_delta(start_ts timestamptz, end_ts timestamptz, step_s BIGINT, range_s BIGINT, t timestamptz[], v double precision[])
+RETURNS double precision[]
+AS '$libdir/timescale_prometheus_extra', 'gapfill_array_delta'
+LANGUAGE C IMMUTABLE STRICT;
+GRANT EXECUTE ON FUNCTION @extschema@.make_call_subquery_support(internal) TO prom_reader;
