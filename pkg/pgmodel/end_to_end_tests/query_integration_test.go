@@ -1085,7 +1085,7 @@ func generatePrometheusWALFile() (string, error) {
 
 	app := st.Appender()
 
-	tts := generateLargeTimeseries()
+	tts := append(generateLargeTimeseries(), generateRealTimeseries()...)
 	var ref *uint64
 
 	for _, ts := range tts {
